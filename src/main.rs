@@ -48,6 +48,7 @@ fn main() {
     lookup.insert_unit(Unit::fake(String::from("exe"), LinkBehaviour::Static, vec![start, got]));
 
     lookup.link(elfs);
+    // TODO garbage collect unused units
 
     println!("linking {} units into exe", lookup.units.len());
 
@@ -102,7 +103,7 @@ fn main() {
     let mut bootstrap = vec![0;boostrap_len];
     let sh_index_bootstrap = out_elf.sections.len();
     out_elf.sections.push(Section::new(String::from(".bootstrap"), types::SectionType::PROGBITS,
-                                       types::SectionFlags::ALLOC | types::SectionFlags::WRITE |
+                                       types::SectionFlags::ALLOC |
                                        types::SectionFlags::EXECINSTR,
                                        SectionContent::Raw(bootstrap),
                                        0,0));
@@ -328,7 +329,47 @@ fn main() {
     out_elf.sections[sh_index_bootstrap].content = SectionContent::Raw(bootstrap);
 
 
+    let mut sc_relink = Vec::new();
+    for sec in &out_elf.sections {
+        let io = &mut sc_relink;
+        elf_write_u32!(&out_elf.header, io, sec.header.offset as u32);
+    }
 
+    // merge segments
+    let mut text_off     = None;
+    let mut text_content = Vec::new();
+    let mut bss_off      = None;
+    let mut bss_size     = 0;
+
+    //TODO this only works because we layed it out continously earlier
+    for mut sec in out_elf.sections.drain(sh_index_bootstrap+1..) {
+        match sec.header.shtype {
+            types::SectionType::PROGBITS => {
+                if text_off == None {
+                    text_off = Some(sec.header.offset);
+                }
+                text_content.extend(sec.content.as_raw_mut().unwrap().drain(..));
+            },
+            types::SectionType::NOBITS => {
+                if bss_off == None {
+                    bss_off = Some(sec.header.offset);
+                }
+                bss_size += sec.header.size;
+            },
+            _ => unreachable!(),
+        };
+    }
+    out_elf.sections.push(Section::new(String::from(".text"),
+    types::SectionType::PROGBITS,
+    types::SectionFlags::ALLOC | types::SectionFlags::WRITE | types::SectionFlags::EXECINSTR,
+    SectionContent::Raw(text_content), 0, 0));
+
+    let mut bss = Section::new(String::from(".bss"),
+    types::SectionType::PROGBITS,
+    types::SectionFlags::ALLOC | types::SectionFlags::WRITE,
+    SectionContent::None, 0, 0);
+    bss.header.size = bss_size;
+    out_elf.sections.push(bss);
 
     //store on .dynamic may add strings to dynsym, which will change all the offsets.
     //this is why dynstr is last. this index needs to be changed everytime something is added
@@ -381,6 +422,11 @@ fn main() {
     out_elf.sections.push(Section::new(String::from(".shstrtab"), types::SectionType::STRTAB,
     types::SectionFlags::from_bits_truncate(0),
     SectionContent::Strtab(Strtab::default()),
+    0,0));
+
+    out_elf.sections.push(Section::new(String::from(".relink"), types::SectionType::RELINKABLE,
+    types::SectionFlags::from_bits_truncate(0),
+    SectionContent::Raw(sc_relink),
     0,0));
 
     out_elf.sync_all().unwrap();
